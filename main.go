@@ -6,25 +6,69 @@ import (
 	"github.com/gempir/go-twitch-irc/v4"
 	amqp "github.com/rabbitmq/amqp091-go"
 	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
 	"os"
+	"strconv"
 	"time"
 )
 
 func main() {
 
-	logger, _ := zap.NewProduction()
-	defer logger.Sync()
-	sugar := logger.Sugar()
+	// Load environment variables
+	botUsername := os.Getenv("TWITCH_BOT_USERNAME")
+	botToken := os.Getenv("TWITCH_BOT_TOKEN")
+	twitchChannel := os.Getenv("TWITCH_BOT_CHANNEL")
+	welcomeMessage := os.Getenv("TWITCH_BOT_WELCOME_MESSAGE")
 
-	conn, err := amqp.Dial("amqp://user:password@localhost:5672")
+	rabbitmqUsername := os.Getenv("RABBITMQ_USERNAME")
+	rabbitmqPassword := os.Getenv("RABBITMQ_PASSWORD")
+	rabbitmqHost := os.Getenv("RABBITMQ_HOST")
+	rabbitmqPort, err := strconv.Atoi(os.Getenv("RABBITMQ_PORT"))
 	if err != nil {
-		sugar.Panicf("%s: %s", "Failed to connect to RabbitMQ", err)
+		fmt.Println("Error during RabbitMQ Port environment variable conversion ")
+		return
+	}
+
+	// Init Zap Logger
+	loggerMgr := initZapLog()
+	zap.ReplaceGlobals(loggerMgr)
+	defer loggerMgr.Sync()
+	logger := loggerMgr.Sugar()
+
+	// Init RabbitMQ Queues
+	ctx, ch := initQueues(logger, rabbitmqUsername, rabbitmqPassword, rabbitmqHost, rabbitmqPort)
+
+	// Init Twitch Client
+	client := initTwitchClient(logger, ctx, ch, botUsername, botToken, twitchChannel, welcomeMessage)
+	err = client.Connect()
+	if err != nil {
+		panic(err)
+	}
+}
+
+func initZapLog() *zap.Logger {
+	config := zap.NewProductionConfig()
+	config.EncoderConfig.EncodeLevel = zapcore.CapitalColorLevelEncoder
+	config.EncoderConfig.TimeKey = "timestamp"
+	config.EncoderConfig.EncodeTime = zapcore.ISO8601TimeEncoder
+	logger, _ := config.Build()
+
+	return logger
+}
+
+func initQueues(logger *zap.SugaredLogger, rabbitmqUsername string,
+	rabbitmqPassword string, rabbitmqHost string, rabbitmqPort int) (context.Context, *amqp.Channel) {
+
+	conn, err := amqp.Dial(fmt.Sprintf("amqp://%s:%s@%s:%d",
+		rabbitmqUsername, rabbitmqPassword, rabbitmqHost, rabbitmqPort))
+	if err != nil {
+		logger.Panicf("%s: %s", "Failed to connect to RabbitMQ", err)
 	}
 	defer conn.Close()
 
 	ch, err := conn.Channel()
 	if err != nil {
-		sugar.Panicf("%s: %s", "Failed to open a channel", err)
+		logger.Panicf("%s: %s", "Failed to open a channel", err)
 	}
 	defer ch.Close()
 
@@ -38,26 +82,43 @@ func main() {
 		nil,
 	)
 	if err != nil {
-		sugar.Panicf("%s: %s", "Failed to declare a exchange", err)
+		logger.Panicf("%s: %s", "Failed to declare a private-message exchange", err)
+	}
+
+	err = ch.ExchangeDeclare(
+		"whisper-message",
+		"fanout",
+		true,
+		false,
+		false,
+		false,
+		nil,
+	)
+	if err != nil {
+		logger.Panicf("%s: %s", "Failed to declare a whisper-message exchange", err)
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	username := os.Getenv("TWITCH_BOT_USERNAME")
-	token := os.Getenv("TWITCH_BOT_TOKEN")
-	channel := os.Getenv("TWITCH_BOT_CHANNEL")
+	return ctx, ch
+}
 
-	client := twitch.NewClient(username, token)
+func initTwitchClient(logger *zap.SugaredLogger, context context.Context,
+	channel *amqp.Channel, botUsername string, botToken string,
+	twitchChannel string, welcomeMessage string) *twitch.Client {
+
+	client := twitch.NewClient(botUsername, botToken)
 
 	client.OnConnect(func() {
-		sugar.Info(fmt.Sprintf("Conectado com o nome de usuário %s ao canal %s", username, channel))
-		client.Say(channel, "A mãe tá on! HeyGuys")
+		logger.Info(fmt.Sprintf("Conectado com o nome de usuário %s ao canal %s",
+			botUsername, twitchChannel))
+		client.Say(twitchChannel, welcomeMessage)
 	})
 
 	client.OnPrivateMessage(func(message twitch.PrivateMessage) {
-		sugar.Info(fmt.Sprintf("Mensagem recebida de %s: %s", message.User.DisplayName, message.Message))
-		err := ch.PublishWithContext(ctx,
+		logger.Info(fmt.Sprintf("Mensagem recebida de %s: %s", message.User.DisplayName, message.Message))
+		err := channel.PublishWithContext(context,
 			"private-message",
 			"",
 			false,
@@ -67,18 +128,27 @@ func main() {
 				Body:        []byte(message.Message),
 			})
 		if err != nil {
-			sugar.Panicf("%s: %s", "Failed to publish message", err)
+			logger.Panicf("%s: %s", "Failed to publish message", err)
 		}
 	})
 
 	client.OnWhisperMessage(func(message twitch.WhisperMessage) {
-		sugar.Info(fmt.Sprintf("Sussurro recebido de %s: %s", message.User.DisplayName, message.Message))
+		logger.Info(fmt.Sprintf("Mensagem recebida de %s: %s", message.User.DisplayName, message.Message))
+		err := channel.PublishWithContext(context,
+			"whisper-message",
+			"",
+			false,
+			false,
+			amqp.Publishing{
+				ContentType: "text/plain",
+				Body:        []byte(message.Message),
+			})
+		if err != nil {
+			logger.Panicf("%s: %s", "Failed to publish message", err)
+		}
 	})
 
-	client.Join(channel)
+	client.Join(twitchChannel)
 
-	err = client.Connect()
-	if err != nil {
-		panic(err)
-	}
+	return client
 }
